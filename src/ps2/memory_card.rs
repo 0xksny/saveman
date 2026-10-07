@@ -44,9 +44,190 @@ pub struct MemoryCard {
     bytes: Vec<u8>,
 }
 
-impl MemoryCard {
-    pub fn new(bytes: Vec<u8>) -> Self {
+impl From<Vec<u8>> for MemoryCard {
+    fn from(bytes: Vec<u8>) -> Self {
         MemoryCard { bytes }
+    }
+}
+
+impl From<MemoryCard> for Vec<u8> {
+    fn from(memory_card: MemoryCard) -> Self {
+        memory_card.bytes
+    }
+}
+
+impl MemoryCard {
+    fn write_cluster_bytes(&mut self, cluster: u32, offset: usize, contents: &[u8]) -> Result<()> {
+        let (page_len, pages_per_cluster, page_stride) = self.geometry()?;
+        let cluster_len = page_len * pages_per_cluster;
+        anyhow::ensure!(
+            offset
+                .checked_add(contents.len())
+                .context("cluster write range overflow")?
+                <= cluster_len,
+            "cluster write exceeds cluster size"
+        );
+        let first_page = usize::try_from(cluster)?
+            .checked_mul(pages_per_cluster)
+            .context("cluster page offset overflow")?;
+        let mut copied = 0;
+        while copied < contents.len() {
+            let logical_offset = offset + copied;
+            let page = logical_offset / page_len;
+            let in_page = logical_offset % page_len;
+            let length = (page_len - in_page).min(contents.len() - copied);
+            let physical = (first_page + page)
+                .checked_mul(page_stride)
+                .and_then(|value| value.checked_add(in_page))
+                .context("page offset overflow")?;
+            let end = physical
+                .checked_add(length)
+                .context("page range overflow")?;
+            self.bytes
+                .get_mut(physical..end)
+                .context("writing memory card page")?
+                .copy_from_slice(&contents[copied..copied + length]);
+            copied += length;
+        }
+        Ok(())
+    }
+
+    fn set_fat_entry(&mut self, relative_cluster: u32, value: u32) -> Result<()> {
+        let (page_len, pages_per_cluster, _) = self.geometry()?;
+        let entries_per_cluster = page_len
+            .checked_mul(pages_per_cluster)
+            .context("cluster size overflow")?
+            / 4;
+        let fat_cluster_index = usize::try_from(relative_cluster)? / entries_per_cluster;
+        let entry_index = usize::try_from(relative_cluster)? % entries_per_cluster;
+        let indirect_index = fat_cluster_index / entries_per_cluster;
+        let indirect_entry_index = fat_cluster_index % entries_per_cluster;
+        let ifc_cluster = self.get_superblock_ifc_list_item(indirect_index)?;
+        anyhow::ensure!(
+            ifc_cluster != CLUSTER_LINK_END,
+            "missing indirect FAT cluster"
+        );
+        let fat_cluster = get_u32(&self.read_cluster(ifc_cluster)?, indirect_entry_index * 4)?;
+        anyhow::ensure!(fat_cluster != CLUSTER_LINK_END, "missing FAT cluster entry");
+        // IFC entries contain physical cluster numbers, as used by `fat_entry`.
+        self.write_cluster_bytes(fat_cluster, entry_index * 4, &value.to_le_bytes())
+    }
+
+    fn delete_directory_contents(
+        &mut self,
+        first_cluster: u32,
+        entry_count: u32,
+        depth: usize,
+        clusters_to_free: &mut Vec<u32>,
+    ) -> Result<()> {
+        anyhow::ensure!(depth <= 64, "directory nesting exceeds 64 levels");
+        let alloc_start = self.get_superblock_alloc_offset()?;
+        let chain = self.cluster_chain(first_cluster)?;
+        let mut contents = Vec::new();
+        for cluster in &chain {
+            contents.extend(
+                self.read_cluster(
+                    alloc_start
+                        .checked_add(*cluster)
+                        .context("physical cluster number overflow")?,
+                )?,
+            );
+        }
+        let count = usize::try_from(entry_count)?;
+        anyhow::ensure!(
+            count <= contents.len() / DIR_ENTRY_LENGTH,
+            "directory entry count exceeds its cluster chain"
+        );
+        let cluster_len =
+            self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
+
+        for index in 2..count {
+            let offset = index * DIR_ENTRY_LENGTH;
+            let mode = get_u16(&contents, offset)?;
+            if mode & DIR_ENTRY_MODE_EXISTS == 0 {
+                continue;
+            }
+            let child_cluster = get_u32(&contents, offset + 0x10)?;
+            if mode & DIR_ENTRY_MODE_DIRECTORY != 0 {
+                self.delete_directory_contents(
+                    child_cluster,
+                    get_u32(&contents, offset + 4)?,
+                    depth + 1,
+                    clusters_to_free,
+                )?;
+                clusters_to_free.extend(self.cluster_chain(child_cluster)?);
+            } else if mode & DIR_ENTRY_MODE_FILE != 0 && get_u32(&contents, offset + 4)? > 0 {
+                clusters_to_free.extend(self.cluster_chain(child_cluster)?);
+            }
+            let physical_dir_cluster = alloc_start
+                .checked_add(chain[offset / cluster_len])
+                .context("physical directory cluster overflow")?;
+            self.write_cluster_bytes(physical_dir_cluster, offset % cluster_len, &[0, 0])?;
+        }
+        clusters_to_free.extend(chain);
+        Ok(())
+    }
+
+    pub fn delete_save_folder(&mut self, name: &str) -> Result<()> {
+        let root_cluster = self.get_superblock_rootdir_cluster()?;
+        let alloc_start = self.get_superblock_alloc_offset()?;
+        let root_chain = self.cluster_chain(root_cluster)?;
+        let mut root = Vec::new();
+        for cluster in &root_chain {
+            root.extend(
+                self.read_cluster(
+                    alloc_start
+                        .checked_add(*cluster)
+                        .context("physical cluster number overflow")?,
+                )?,
+            );
+        }
+        let count = usize::try_from(get_u32(&root, 4)?)?;
+        anyhow::ensure!(
+            count <= root.len() / DIR_ENTRY_LENGTH,
+            "root directory entry count exceeds its cluster chain"
+        );
+        let mut found = None;
+        for index in 1..count {
+            let offset = index * DIR_ENTRY_LENGTH;
+            let mode = get_u16(&root, offset)?;
+            if mode & (DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY)
+                != (DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY)
+            {
+                continue;
+            }
+            let bytes = &root[offset + 0x40..offset + 0x60];
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            if bytes[..end].eq_ignore_ascii_case(name.as_bytes()) {
+                anyhow::ensure!(found.is_none(), "multiple save folders named {name:?}");
+                found = Some((
+                    index,
+                    get_u32(&root, offset + 4)?,
+                    get_u32(&root, offset + 0x10)?,
+                ));
+            }
+        }
+        let (index, entry_count, folder_cluster) = found.context("save folder not found")?;
+        let mut to_free = Vec::new();
+        self.delete_directory_contents(folder_cluster, entry_count, 0, &mut to_free)?;
+        to_free.sort_unstable();
+        to_free.dedup();
+        for cluster in to_free {
+            self.set_fat_entry(cluster, 0)?;
+        }
+
+        let mode_offset = index * DIR_ENTRY_LENGTH;
+        let cluster_len =
+            self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
+        let physical = alloc_start
+            .checked_add(root_chain[mode_offset / cluster_len])
+            .context("physical root cluster overflow")?;
+        let local_offset = mode_offset % cluster_len;
+        self.write_cluster_bytes(physical, local_offset, &[0, 0])?;
+        Ok(())
     }
 
     fn get_bytes(&self, offset: usize, length: usize) -> Result<Vec<u8>> {

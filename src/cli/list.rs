@@ -16,7 +16,7 @@ impl ListCommand {
     pub fn run(self) -> Result<()> {
         let bytes = fs::read(self.path).context("reading file")?;
 
-        let memory_card = MemoryCard::new(bytes);
+        let memory_card = MemoryCard::from(bytes);
 
         let mut builder = Builder::new();
         builder.push_record(["Save folder", "Title"]);

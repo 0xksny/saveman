@@ -17,7 +17,7 @@ impl DumpCommand {
     pub fn run(self) -> Result<()> {
         let bytes = fs::read(self.path).context("reading file")?;
 
-        let memory_card = MemoryCard::new(bytes);
+        let memory_card = MemoryCard::from(bytes);
 
         memory_card
             .dump_to(&self.dst)
