@@ -11,6 +11,15 @@ const DIR_ENTRY_LENGTH: usize = 512;
 const DIR_ENTRY_MODE_EXISTS: u16 = 0x8000;
 const DIR_ENTRY_MODE_FILE: u16 = 0x0010;
 const DIR_ENTRY_MODE_DIRECTORY: u16 = 0x0020;
+const PAGE_LEN: usize = 512;
+const PAGE_SPARE_LEN: usize = 16;
+const CLUSTERS_PER_CARD: usize = 8192;
+const PAGES_PER_CLUSTER: usize = 2;
+const ALLOC_OFFSET: usize = 41;
+
+fn set_bytes(bytes: &mut Vec<u8>, offset: usize, value: &[u8]) {
+    bytes[offset..offset + value.len()].copy_from_slice(value);
+}
 
 fn get_bytes(bytes: &Vec<u8>, offset: usize, length: usize) -> Result<&[u8]> {
     bytes.get(offset..offset + length).context("getting bytes")
@@ -40,6 +49,26 @@ fn get_u32(bytes: &Vec<u8>, offset: usize) -> Result<u32> {
     ))
 }
 
+fn calculate_ecc(chunk: &[u8]) -> [u8; 3] {
+    let mut column = 0x77u8;
+    let mut line_complement = 0x7Fu8;
+    let mut line = 0x7Fu8;
+    for (index, byte) in chunk.iter().copied().enumerate() {
+        for (bit, mask) in [0x55u8, 0x33, 0x0F, 0x00, 0xAA, 0xCC, 0xF0]
+            .into_iter()
+            .enumerate()
+        {
+            column ^= (((byte & mask).count_ones() & 1) as u8) << bit;
+        }
+        if byte.count_ones() & 1 != 0 {
+            let index = index as u8;
+            line_complement ^= !index;
+            line ^= index;
+        }
+    }
+    [column, line_complement & 0x7F, line & 0x7F]
+}
+
 pub struct MemoryCard {
     bytes: Vec<u8>,
 }
@@ -57,6 +86,73 @@ impl From<MemoryCard> for Vec<u8> {
 }
 
 impl MemoryCard {
+    pub fn new() -> Self {
+        let data_len = CLUSTERS_PER_CARD * PAGES_PER_CLUSTER * PAGE_LEN;
+        let mut data = vec![0; data_len];
+
+        set_bytes(&mut data, 0x0000, b"Sony PS2 Memory Card Format ");
+        set_bytes(&mut data, 0x001C, b"1.2.0.0\0\0\0\0\0");
+        set_bytes(&mut data, 0x0028, &512u16.to_le_bytes());
+        set_bytes(&mut data, 0x002A, &2u16.to_le_bytes());
+        set_bytes(&mut data, 0x002C, &16u16.to_le_bytes());
+        set_bytes(&mut data, 0x002E, &0xFF00u16.to_le_bytes());
+        set_bytes(&mut data, 0x0030, &(CLUSTERS_PER_CARD as u32).to_le_bytes());
+        set_bytes(&mut data, 0x0034, &(ALLOC_OFFSET as u32).to_le_bytes());
+        set_bytes(&mut data, 0x0038, &8135u32.to_le_bytes());
+        set_bytes(&mut data, 0x003C, &0u32.to_le_bytes());
+        set_bytes(&mut data, 0x0040, &1023u32.to_le_bytes());
+        set_bytes(&mut data, 0x0044, &1022u32.to_le_bytes());
+        // The IFC cluster is at absolute cluster 8; its first entry points
+        // to the first FAT cluster at absolute cluster 9.
+        set_bytes(&mut data, 0x0050, &8u32.to_le_bytes());
+        data[0x0054..0x00D0].fill(0xFF);
+        data[0x00D0..0x0150].fill(0xFF);
+        set_bytes(&mut data, 0x0150, &[2, 0x52]);
+
+        // IFC cluster (absolute 8) maps the 32 FAT clusters at absolute 9..40.
+        let cluster_len = PAGE_LEN * PAGES_PER_CLUSTER;
+        let ifc_offset = 8 * cluster_len;
+        for index in 0..32 {
+            let fat_cluster = 9u32 + index as u32;
+            let offset = ifc_offset + index * 4;
+            data[offset..offset + 4].copy_from_slice(&fat_cluster.to_le_bytes());
+        }
+        data[ifc_offset + 32 * 4..ifc_offset + cluster_len].fill(0xFF);
+
+        // The FAT marks the root directory's single cluster as allocated and
+        // terminated. All other allocation entries remain free (zero).
+        let first_fat_offset = 9 * cluster_len;
+        data[first_fat_offset..first_fat_offset + 4]
+            .copy_from_slice(&CLUSTER_LINK_END.to_le_bytes());
+
+        // Root directory's first entry describes the root itself.
+        let root_offset = ALLOC_OFFSET * cluster_len;
+        data[root_offset..root_offset + 2]
+            .copy_from_slice(&(DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY).to_le_bytes());
+        data[root_offset + 4..root_offset + 8].copy_from_slice(&1u32.to_le_bytes());
+        data[root_offset + 0x10..root_offset + 0x14].copy_from_slice(&0u32.to_le_bytes());
+        data[root_offset + 0x40] = b'.';
+
+        // Expand each logical 512-byte page into the raw 528-byte layout and
+        // write the standard ECC codes into its spare area.
+        let page_count = data_len / PAGE_LEN;
+        let raw_page_len = PAGE_LEN + PAGE_SPARE_LEN;
+        let mut bytes = vec![0; page_count * raw_page_len];
+        for page_index in 0..page_count {
+            let source = &data[page_index * PAGE_LEN..(page_index + 1) * PAGE_LEN];
+            let target = page_index * raw_page_len;
+            bytes[target..target + PAGE_LEN].copy_from_slice(source);
+            for chunk_index in 0..4 {
+                let chunk = &source[chunk_index * 128..(chunk_index + 1) * 128];
+                let ecc = calculate_ecc(chunk);
+                let spare = target + PAGE_LEN + chunk_index * 3;
+                bytes[spare..spare + 3].copy_from_slice(&ecc);
+            }
+        }
+
+        MemoryCard { bytes }
+    }
+
     fn write_cluster_bytes(&mut self, cluster: u32, offset: usize, contents: &[u8]) -> Result<()> {
         let (page_len, pages_per_cluster, page_stride) = self.geometry()?;
         let cluster_len = page_len * pages_per_cluster;
@@ -227,6 +323,184 @@ impl MemoryCard {
             .context("physical root cluster overflow")?;
         let local_offset = mode_offset % cluster_len;
         self.write_cluster_bytes(physical, local_offset, &[0, 0])?;
+        Ok(())
+    }
+
+    pub fn copy_save_folder_from(&mut self, source: &MemoryCard, name: &str) -> Result<()> {
+        let root = source.read_cluster_chain(source.get_superblock_rootdir_cluster()?)?;
+        let count = usize::try_from(get_u32(&root, 4)?)?;
+        let mut source_entry = None;
+        for index in 1..count {
+            let offset = index * DIR_ENTRY_LENGTH;
+            let mode = get_u16(&root, offset)?;
+            let bytes = &root[offset + 0x40..offset + 0x60];
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            if mode & (DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY)
+                == (DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY)
+                && bytes[..end].eq_ignore_ascii_case(name.as_bytes())
+            {
+                anyhow::ensure!(
+                    source_entry.is_none(),
+                    "multiple save folders named {name:?}"
+                );
+                source_entry = Some(root[offset..offset + DIR_ENTRY_LENGTH].to_vec());
+            }
+        }
+        let entry = source_entry.context("save folder not found")?;
+        let dst_root_chain = self.cluster_chain(self.get_superblock_rootdir_cluster()?)?;
+        let dst_root = self.read_cluster_chain(self.get_superblock_rootdir_cluster()?)?;
+        let dst_count = usize::try_from(get_u32(&dst_root, 4)?)?;
+        for index in 1..dst_count {
+            let offset = index * DIR_ENTRY_LENGTH;
+            let mode = get_u16(&dst_root, offset)?;
+            let bytes = &dst_root[offset + 0x40..offset + 0x60];
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
+            anyhow::ensure!(
+                mode & DIR_ENTRY_MODE_EXISTS == 0
+                    || !bytes[..end].eq_ignore_ascii_case(name.as_bytes()),
+                "save folder {name:?} already exists on destination"
+            );
+        }
+        let free_slot = (1..dst_root.len() / DIR_ENTRY_LENGTH)
+            .find(|index| {
+                get_u16(&dst_root, index * DIR_ENTRY_LENGTH)
+                    .is_ok_and(|mode| mode & DIR_ENTRY_MODE_EXISTS == 0)
+            })
+            .context("destination root directory is full")?;
+
+        let mut dir_specs = Vec::new();
+        let mut all_chains: Vec<Vec<u32>> = Vec::new();
+        let mut pending = vec![(get_u32(&entry, 0x10)?, get_u32(&entry, 4)?, None)];
+        let mut visited = Vec::new();
+        while let Some((first, entries, parent)) = pending.pop() {
+            anyhow::ensure!(
+                !visited.contains(&first),
+                "directory cycle detected at cluster {first}"
+            );
+            visited.push(first);
+            let chain = source.cluster_chain(first)?;
+            let contents = source.read_cluster_chain(first)?;
+            anyhow::ensure!(
+                usize::try_from(entries)? <= contents.len() / DIR_ENTRY_LENGTH,
+                "directory entry count exceeds its cluster chain"
+            );
+            for i in 2..usize::try_from(entries)? {
+                let off = i * DIR_ENTRY_LENGTH;
+                let mode = get_u16(&contents, off)?;
+                if mode & DIR_ENTRY_MODE_EXISTS == 0 {
+                    continue;
+                }
+                let child = get_u32(&contents, off + 0x10)?;
+                if mode & DIR_ENTRY_MODE_DIRECTORY != 0 {
+                    pending.push((child, get_u32(&contents, off + 4)?, Some(first)));
+                } else if mode & DIR_ENTRY_MODE_FILE != 0 && get_u32(&contents, off + 4)? > 0 {
+                    all_chains.push(source.cluster_chain(child)?);
+                }
+            }
+            all_chains.push(chain.clone());
+            dir_specs.push((first, entries, chain, parent));
+        }
+
+        let mut allocated = Vec::new();
+        for rel in
+            0..self.get_superblock_clusters_per_card()? - self.get_superblock_alloc_offset()?
+        {
+            if self.fat_entry(rel)? == 0 {
+                allocated.push(rel);
+            }
+        }
+        let required: usize = all_chains.iter().map(Vec::len).sum();
+        anyhow::ensure!(
+            allocated.len() >= required,
+            "destination memory card has insufficient free space"
+        );
+        let alloc_start = self.get_superblock_alloc_offset()?;
+        let mut mappings = std::collections::HashMap::new();
+        let mut next = allocated.into_iter();
+        for chain in &all_chains {
+            for &old in chain {
+                mappings
+                    .entry(old)
+                    .or_insert_with(|| next.next().expect("capacity checked"));
+            }
+        }
+        for chain in &all_chains {
+            let mapped: Vec<_> = chain.iter().map(|c| mappings[c]).collect();
+            for (i, &cluster) in mapped.iter().enumerate() {
+                let link = mapped
+                    .get(i + 1)
+                    .map(|c| 0x8000_0000 | c)
+                    .unwrap_or(CLUSTER_LINK_END);
+                self.set_fat_entry(cluster, link)?;
+                let data = source.read_cluster(
+                    source
+                        .get_superblock_alloc_offset()?
+                        .checked_add(chain[i])
+                        .context("source cluster overflow")?,
+                )?;
+                self.write_cluster_bytes(
+                    alloc_start
+                        .checked_add(cluster)
+                        .context("destination cluster overflow")?,
+                    0,
+                    &data,
+                )?;
+            }
+        }
+        for (first, entries, chain, parent) in &dir_specs {
+            let mut contents = source.read_cluster_chain(*first)?;
+            contents[0x10..0x14].copy_from_slice(&mappings[first].to_le_bytes());
+            if let Some(parent) = parent {
+                contents[DIR_ENTRY_LENGTH + 0x10..DIR_ENTRY_LENGTH + 0x14]
+                    .copy_from_slice(&mappings[parent].to_le_bytes());
+            } else {
+                contents[DIR_ENTRY_LENGTH + 0x10..DIR_ENTRY_LENGTH + 0x14]
+                    .copy_from_slice(&self.get_superblock_rootdir_cluster()?.to_le_bytes());
+            }
+            for i in 2..usize::try_from(*entries)? {
+                let off = i * DIR_ENTRY_LENGTH;
+                let mode = get_u16(&contents, off)?;
+                if mode & DIR_ENTRY_MODE_EXISTS == 0 {
+                    continue;
+                }
+                let old = get_u32(&contents, off + 0x10)?;
+                if mappings.contains_key(&old) {
+                    contents[off + 0x10..off + 0x14].copy_from_slice(&mappings[&old].to_le_bytes());
+                }
+            }
+            for (ci, &old) in chain.iter().enumerate() {
+                let len =
+                    self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
+                self.write_cluster_bytes(
+                    alloc_start + mappings[&old],
+                    0,
+                    &contents[ci * len..(ci + 1) * len],
+                )?;
+            }
+        }
+        let copied_first = mappings[&get_u32(&entry, 0x10)?];
+        let mut copied_entry = entry;
+        copied_entry[0x10..0x14].copy_from_slice(&copied_first.to_le_bytes());
+        let cluster_len =
+            self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
+        let offset = free_slot * DIR_ENTRY_LENGTH;
+        let physical = alloc_start + dst_root_chain[offset / cluster_len];
+        self.write_cluster_bytes(physical, offset % cluster_len, &copied_entry)?;
+        if free_slot >= dst_count {
+            let count_offset = 4;
+            let count_physical = alloc_start + dst_root_chain[count_offset / cluster_len];
+            self.write_cluster_bytes(
+                count_physical,
+                count_offset % cluster_len,
+                &u32::try_from(free_slot + 1)?.to_le_bytes(),
+            )?;
+        }
         Ok(())
     }
 
