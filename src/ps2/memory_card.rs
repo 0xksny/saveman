@@ -69,6 +69,51 @@ fn calculate_ecc(chunk: &[u8]) -> [u8; 3] {
     [column, line_complement & 0x7F, line & 0x7F]
 }
 
+fn write_page_data(
+    bytes: &mut [u8],
+    page_start: usize,
+    page_len: usize,
+    in_page: usize,
+    contents: &[u8],
+) -> Result<()> {
+    anyhow::ensure!(
+        in_page
+            .checked_add(contents.len())
+            .context("page write range overflow")?
+            <= page_len,
+        "page write exceeds data area"
+    );
+    anyhow::ensure!(
+        page_len % 128 == 0 && page_len / 128 * 3 <= PAGE_SPARE_LEN,
+        "unsupported page length for ECC: {page_len}"
+    );
+    let data_end = page_start
+        .checked_add(page_len)
+        .context("page data range overflow")?;
+    let spare_end = data_end
+        .checked_add(PAGE_SPARE_LEN)
+        .context("page spare range overflow")?;
+    anyhow::ensure!(
+        spare_end <= bytes.len(),
+        "memory card page exceeds image length"
+    );
+    let write_start = page_start
+        .checked_add(in_page)
+        .context("page write offset overflow")?;
+    let write_end = write_start
+        .checked_add(contents.len())
+        .context("page write range overflow")?;
+    bytes[write_start..write_end].copy_from_slice(contents);
+
+    for chunk_index in 0..page_len / 128 {
+        let chunk_start = page_start + chunk_index * 128;
+        let ecc = calculate_ecc(&bytes[chunk_start..chunk_start + 128]);
+        let spare_start = data_end + chunk_index * 3;
+        bytes[spare_start..spare_start + 3].copy_from_slice(&ecc);
+    }
+    Ok(())
+}
+
 pub struct MemoryCard {
     bytes: Vec<u8>,
 }
@@ -133,21 +178,16 @@ impl MemoryCard {
         data[root_offset + 0x10..root_offset + 0x14].copy_from_slice(&0u32.to_le_bytes());
         data[root_offset + 0x40] = b'.';
 
-        // Expand each logical 512-byte page into the raw 528-byte layout and
-        // write the standard ECC codes into its spare area.
+        // Expand each logical page into the raw layout through the same helper
+        // used by later writes, so its spare-area ECC is initialized too.
         let page_count = data_len / PAGE_LEN;
         let raw_page_len = PAGE_LEN + PAGE_SPARE_LEN;
         let mut bytes = vec![0; page_count * raw_page_len];
         for page_index in 0..page_count {
             let source = &data[page_index * PAGE_LEN..(page_index + 1) * PAGE_LEN];
             let target = page_index * raw_page_len;
-            bytes[target..target + PAGE_LEN].copy_from_slice(source);
-            for chunk_index in 0..4 {
-                let chunk = &source[chunk_index * 128..(chunk_index + 1) * 128];
-                let ecc = calculate_ecc(chunk);
-                let spare = target + PAGE_LEN + chunk_index * 3;
-                bytes[spare..spare + 3].copy_from_slice(&ecc);
-            }
+            write_page_data(&mut bytes, target, PAGE_LEN, 0, source)
+                .expect("new memory card page fits its raw image");
         }
 
         MemoryCard { bytes }
@@ -179,10 +219,14 @@ impl MemoryCard {
             let end = physical
                 .checked_add(length)
                 .context("page range overflow")?;
-            self.bytes
-                .get_mut(physical..end)
-                .context("writing memory card page")?
-                .copy_from_slice(&contents[copied..copied + length]);
+            anyhow::ensure!(end <= self.bytes.len(), "writing memory card page");
+            write_page_data(
+                &mut self.bytes,
+                physical - in_page,
+                page_len,
+                in_page,
+                &contents[copied..copied + length],
+            )?;
             copied += length;
         }
         Ok(())
@@ -524,39 +568,25 @@ impl MemoryCard {
         let page_len = usize::from(self.get_superblock_page_len()?);
         let pages_per_cluster = usize::from(self.get_superblock_pages_per_cluster()?);
         let clusters_total = usize::try_from(self.get_superblock_clusters_per_card()?)?;
+        anyhow::ensure!(page_len == PAGE_LEN, "unsupported page length: {page_len}");
         anyhow::ensure!(
-            page_len == 512 || page_len == 1024,
-            "unsupported page length: {page_len}"
-        );
-        anyhow::ensure!(
-            (page_len == 512 && (pages_per_cluster == 1 || pages_per_cluster == 2))
-                || (page_len == 1024 && pages_per_cluster == 1),
+            pages_per_cluster == 1 || pages_per_cluster == 2,
             "unsupported pages-per-cluster value: {pages_per_cluster}"
         );
         anyhow::ensure!(clusters_total > 0, "memory card declares no clusters");
 
-        let data_cluster_len = page_len
-            .checked_mul(pages_per_cluster)
-            .context("cluster size overflow")?;
-        let expected_data_len = clusters_total
-            .checked_mul(data_cluster_len)
-            .context("memory card size overflow")?;
-        let raw_page_len = page_len.checked_add(16).context("raw page size overflow")?;
+        let raw_page_len = page_len
+            .checked_add(PAGE_SPARE_LEN)
+            .context("raw page size overflow")?;
         let expected_raw_len = clusters_total
             .checked_mul(pages_per_cluster)
             .and_then(|pages| pages.checked_mul(raw_page_len))
             .context("raw memory card size overflow")?;
-
-        let page_stride = if self.bytes.len() >= expected_raw_len {
-            raw_page_len
-        } else {
-            anyhow::ensure!(
-                self.bytes.len() >= expected_data_len,
-                "memory card image is shorter than its declared geometry"
-            );
-            page_len
-        };
-        Ok((page_len, pages_per_cluster, page_stride))
+        anyhow::ensure!(
+            self.bytes.len() >= expected_raw_len,
+            "memory card image is shorter than its declared raw geometry"
+        );
+        Ok((page_len, pages_per_cluster, raw_page_len))
     }
 
     fn read_cluster(&self, cluster: u32) -> Result<Vec<u8>> {
