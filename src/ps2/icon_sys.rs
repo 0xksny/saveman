@@ -1,28 +1,3 @@
-/*
-offset  length  description
-0       4       PS2D
-4       2       Reserved (zero)
-6       2       Offset of the second line in the title name
-8       4       Reserved (zero)
-12      4       Background transparency (0x00 transparent, 0x80 opaque)
-16      16      Background color upper left
-32      16      Background color upper right
-48      16      Background color lower left
-64      16      Background color lower right
-80      16      Light 1 direction
-96      16      Light 2 direction
-112     16      Light 3 direction
-128     16      Light 1 RGB
-144     16      Light 2 RGB
-160     16      Light 3 RGB
-176     16      Ambient light RGB
-192     68      Save title (null terminated, Shift JIS)
-260     64      Normal icon filename (null terminated)
-324     64      Copy icon filename (null terminated)
-388     64      Delete icon filename (null terminated)
-452     512     Reserved
-*/
-
 use anyhow::{Context, Result};
 use encoding_rs::SHIFT_JIS;
 

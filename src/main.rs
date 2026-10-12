@@ -4,6 +4,7 @@ use clap::Parser;
 
 use crate::cli::Cli;
 
+mod assets;
 mod cli;
 mod ps2;
 
