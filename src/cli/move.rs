@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -6,6 +5,7 @@ use clap::Args;
 use typed_path::UnixPath;
 
 use crate::cli::CliPath;
+use crate::fs::{FileSystem, PhysicalFileSystem};
 use crate::ps2::{MemoryCard, fs::Path as MemoryCardPath};
 
 #[derive(Args, Clone, Debug, PartialEq)]
@@ -60,6 +60,8 @@ fn is_mc_to_mc<'a>(
 }
 
 fn walk_mc_to_fs(memory_card: &mut MemoryCard, src: &UnixPath, dst: &Path) -> Result<()> {
+    let mut fs = PhysicalFileSystem::new();
+
     for entry in memory_card.read_dir(src)? {
         let entry = entry?;
         let file_name = entry.file_name();
@@ -68,14 +70,14 @@ fn walk_mc_to_fs(memory_card: &mut MemoryCard, src: &UnixPath, dst: &Path) -> Re
         if file_type.is_dir() {
             let src = src.join(&file_name);
             let dst = dst.join(&file_name);
-            fs::create_dir(&dst)?;
+            fs.create_dir(&dst)?;
             walk_mc_to_fs(memory_card, &src, &dst)?;
         } else if file_type.is_file() {
             let path = dst.join(&file_name);
             let contents: Vec<u8> = memory_card
                 .read(entry.path())
-                .context("reading entry at {path}")?;
-            fs::write(&path, &contents)?;
+                .with_context(|| format!("reading entry at {}", entry.path()))?;
+            fs.write(&path, &contents)?;
         }
     }
 
@@ -85,7 +87,9 @@ fn walk_mc_to_fs(memory_card: &mut MemoryCard, src: &UnixPath, dst: &Path) -> Re
 }
 
 fn walk_fs_to_mc(memory_card: &mut MemoryCard, src: &Path, dst: &UnixPath) -> Result<()> {
-    for entry in fs::read_dir(src)? {
+    let fs = PhysicalFileSystem::new();
+
+    for entry in fs.read_dir(src)? {
         let entry = entry?;
         let file_name = entry.file_name();
         let file_type = entry.file_type()?;
@@ -97,7 +101,9 @@ fn walk_fs_to_mc(memory_card: &mut MemoryCard, src: &Path, dst: &UnixPath) -> Re
             walk_fs_to_mc(memory_card, &src, &dst)?;
         } else if file_type.is_file() {
             let path = dst.join(&file_name);
-            let contents = fs::read(entry.path()).context("reading entry at {path}")?;
+            let contents = fs
+                .read(entry.path())
+                .with_context(|| format!("reading entry at {:?}", path))?;
             memory_card.write(&path, &contents)?;
         }
     }
@@ -122,7 +128,7 @@ fn walk_mc_to_mc(memory_card: &mut MemoryCard, src: &UnixPath, dst: &UnixPath) -
             let path = dst.join(&file_name);
             let contents = memory_card
                 .read(entry.path())
-                .context("reading entry at {path}")?;
+                .with_context(|| format!("reading entry at {:?}", path))?;
             memory_card.write(&path, &contents)?;
         }
     }

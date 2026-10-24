@@ -10,6 +10,7 @@ use typed_path::{UnixPath, UnixPathBuf};
 
 use crate::{
     assets::GAME_INDEX,
+    fs::FileSystem,
     ps2::{
         MemoryCard,
         fs::{DirEntry, Path as MemoryCardPath},

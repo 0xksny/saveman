@@ -1,12 +1,16 @@
 use std::{
-    fs,
+    io,
     path::{Component, Path},
 };
 
 use anyhow::{Context, Result, anyhow};
 use typed_path::{UnixComponent, UnixPath};
 
-use crate::ps2::fs::{DirEntry, FileType, ReadDir};
+use crate::{
+    fs::FileSystem,
+    ps2::fs,
+    ps2::fs::{DirEntry, FileType},
+};
 
 const CLUSTER_LINK_END: u32 = u32::MAX;
 const DIR_ENTRY_LENGTH: usize = 512;
@@ -255,6 +259,54 @@ impl MemoryCard {
         self.write_cluster_bytes(fat_cluster, entry_index * 4, &value.to_le_bytes())
     }
 
+    fn allocate_free_cluster(&mut self) -> Result<u32> {
+        let alloc_start = self.get_superblock_alloc_offset()?;
+        let alloc_count = self
+            .get_superblock_clusters_per_card()?
+            .checked_sub(alloc_start)
+            .context("allocation start is beyond card")?;
+        for cluster in 0..alloc_count {
+            if self.fat_entry(cluster)? == 0 {
+                self.set_fat_entry(cluster, CLUSTER_LINK_END)?;
+                let cluster_len =
+                    self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
+                self.write_cluster_bytes(alloc_start + cluster, 0, &vec![0; cluster_len])?;
+                return Ok(cluster);
+            }
+        }
+        anyhow::bail!("memory card has insufficient free space")
+    }
+
+    fn find_or_grow_directory_slot(
+        &mut self,
+        directory: u32,
+        contents: &mut Vec<u8>,
+        first_child: usize,
+    ) -> Result<usize> {
+        let capacity = contents.len() / DIR_ENTRY_LENGTH;
+        if let Some(slot) = (first_child..capacity).find(|index| {
+            get_u16(contents, index * DIR_ENTRY_LENGTH)
+                .is_ok_and(|mode| mode & DIR_ENTRY_MODE_EXISTS == 0)
+        }) {
+            return Ok(slot);
+        }
+
+        let cluster_len =
+            self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
+        anyhow::ensure!(
+            cluster_len % DIR_ENTRY_LENGTH == 0,
+            "directory cluster cannot hold whole entries"
+        );
+        let chain = self.cluster_chain(directory)?;
+        let last = *chain
+            .last()
+            .context("directory has an empty cluster chain")?;
+        let new_cluster = self.allocate_free_cluster()?;
+        self.set_fat_entry(last, 0x8000_0000 | new_cluster)?;
+        contents.resize(contents.len() + cluster_len, 0);
+        Ok(capacity)
+    }
+
     fn delete_directory_contents(
         &mut self,
         first_cluster: u32,
@@ -308,294 +360,6 @@ impl MemoryCard {
         }
         clusters_to_free.extend(chain);
         Ok(())
-    }
-
-    pub fn add_path(&mut self, src: &Path, dst: &Path) -> Result<()> {
-        #[derive(Debug)]
-        enum Node {
-            File(String, Vec<u8>),
-            Directory(String, Vec<Node>),
-        }
-
-        fn read_node(path: &Path, name: String, depth: usize) -> Result<Node> {
-            anyhow::ensure!(depth <= 64, "source directory nesting exceeds 64 levels");
-            MemoryCard::validate_entry_name(&name)?;
-            let metadata = fs::symlink_metadata(path)
-                .with_context(|| format!("inspecting source {}", path.display()))?;
-            anyhow::ensure!(
-                !metadata.file_type().is_symlink(),
-                "source symlinks are not supported: {}",
-                path.display()
-            );
-            if metadata.is_file() {
-                return Ok(Node::File(
-                    name,
-                    fs::read(path)
-                        .with_context(|| format!("reading source file {}", path.display()))?,
-                ));
-            }
-            anyhow::ensure!(
-                metadata.is_dir(),
-                "source is not a regular file or directory: {}",
-                path.display()
-            );
-            let mut children = Vec::new();
-            for child in fs::read_dir(path)
-                .with_context(|| format!("reading source directory {}", path.display()))?
-            {
-                let child = child?;
-                let child_name = child.file_name().into_string().map_err(|_| {
-                    anyhow::anyhow!(
-                        "source entry name is not valid UTF-8: {}",
-                        child.path().display()
-                    )
-                })?;
-                children.push(read_node(&child.path(), child_name, depth + 1)?);
-            }
-            children.sort_by(|a, b| {
-                node_name(a)
-                    .to_ascii_lowercase()
-                    .cmp(&node_name(b).to_ascii_lowercase())
-            });
-            Ok(Node::Directory(name, children))
-        }
-
-        fn node_name(node: &Node) -> &str {
-            match node {
-                Node::File(name, _) | Node::Directory(name, _) => name,
-            }
-        }
-
-        fn allocate(card: &mut MemoryCard, contents: &[u8]) -> Result<u32> {
-            let cluster_len = card.geometry()?.0 * card.geometry()?.1;
-            let needed = contents.len().max(1).div_ceil(cluster_len);
-            let alloc_start = card.get_superblock_alloc_offset()?;
-            let alloc_count = card
-                .get_superblock_clusters_per_card()?
-                .checked_sub(alloc_start)
-                .context("allocation start is beyond card")?;
-            let mut free = Vec::with_capacity(needed);
-            for cluster in 0..alloc_count {
-                if card.fat_entry(cluster)? == 0 {
-                    free.push(cluster);
-                    if free.len() == needed {
-                        break;
-                    }
-                }
-            }
-            anyhow::ensure!(
-                free.len() == needed,
-                "memory card has insufficient free space"
-            );
-            for (index, &cluster) in free.iter().enumerate() {
-                let next = free
-                    .get(index + 1)
-                    .map(|next| 0x8000_0000 | next)
-                    .unwrap_or(CLUSTER_LINK_END);
-                card.set_fat_entry(cluster, next)?;
-                let from = index * cluster_len;
-                let to = (from + cluster_len).min(contents.len());
-                let mut block = vec![0; cluster_len];
-                if from < to {
-                    block[..to - from].copy_from_slice(&contents[from..to]);
-                }
-                card.write_cluster_bytes(alloc_start + cluster, 0, &block)?;
-            }
-            Ok(free[0])
-        }
-
-        fn make_entry(
-            name: &str,
-            mode: u16,
-            size: u32,
-            cluster: u32,
-            created: u32,
-            modified: u32,
-        ) -> Result<Vec<u8>> {
-            if name != "." && name != ".." {
-                MemoryCard::validate_entry_name(name)?;
-            }
-            anyhow::ensure!(
-                name.len() <= 31,
-                "memory card entry name is longer than 31 bytes: {name:?}"
-            );
-            let mut entry = vec![0; DIR_ENTRY_LENGTH];
-            entry[0..2].copy_from_slice(&(DIR_ENTRY_MODE_EXISTS | mode).to_le_bytes());
-            entry[4..8].copy_from_slice(&size.to_le_bytes());
-            entry[8..12].copy_from_slice(&created.to_le_bytes());
-            entry[12..16].copy_from_slice(&modified.to_le_bytes());
-            entry[0x10..0x14].copy_from_slice(&cluster.to_le_bytes());
-            entry[0x40..0x40 + name.len()].copy_from_slice(name.as_bytes());
-            Ok(entry)
-        }
-
-        fn insert_child(
-            card: &mut MemoryCard,
-            node: Node,
-            parent: u32,
-            depth: usize,
-        ) -> Result<Vec<u8>> {
-            anyhow::ensure!(depth <= 64, "directory nesting exceeds 64 levels");
-            match node {
-                Node::File(name, data) => {
-                    let cluster = if data.is_empty() {
-                        0
-                    } else {
-                        allocate(card, &data)?
-                    };
-                    make_entry(
-                        &name,
-                        DIR_ENTRY_MODE_FILE,
-                        u32::try_from(data.len())?,
-                        cluster,
-                        0,
-                        0,
-                    )
-                }
-                Node::Directory(name, children) => {
-                    let entry_count = children.len() + 2;
-                    let cluster = allocate(card, &vec![0; entry_count * DIR_ENTRY_LENGTH])?;
-                    let mut entries = vec![
-                        make_entry(
-                            ".",
-                            DIR_ENTRY_MODE_DIRECTORY,
-                            u32::try_from(entry_count)?,
-                            cluster,
-                            0,
-                            0,
-                        )?,
-                        make_entry("..", DIR_ENTRY_MODE_DIRECTORY, 0, parent, 0, 0)?,
-                    ];
-                    for child in children {
-                        entries.push(insert_child(card, child, cluster, depth + 1)?);
-                    }
-                    let mut contents = vec![0; entry_count * DIR_ENTRY_LENGTH];
-                    for (i, entry) in entries.iter().enumerate() {
-                        contents[i * DIR_ENTRY_LENGTH..(i + 1) * DIR_ENTRY_LENGTH]
-                            .copy_from_slice(entry);
-                    }
-                    write_chain_data(card, cluster, &contents)?;
-                    make_entry(
-                        &name,
-                        DIR_ENTRY_MODE_DIRECTORY,
-                        u32::try_from(entry_count)?,
-                        cluster,
-                        0,
-                        0,
-                    )
-                }
-            }
-        }
-
-        fn write_chain_data(card: &mut MemoryCard, first: u32, data: &[u8]) -> Result<()> {
-            let chain = card.cluster_chain(first)?;
-            let len = card.geometry()?.0 * card.geometry()?.1;
-            for (index, cluster) in chain.into_iter().enumerate() {
-                let start = index * len;
-                if start >= data.len() {
-                    break;
-                }
-                let end = (start + len).min(data.len());
-                card.write_cluster_bytes(
-                    card.get_superblock_alloc_offset()? + cluster,
-                    0,
-                    &data[start..end],
-                )?;
-            }
-            Ok(())
-        }
-
-        fn add_entry(card: &mut MemoryCard, directory: u32, entry: &[u8]) -> Result<()> {
-            let mut contents = card.read_cluster_chain(directory)?;
-            let count = usize::try_from(get_u32(&contents, 4)?)?;
-            anyhow::ensure!(
-                count <= contents.len() / DIR_ENTRY_LENGTH,
-                "directory entry count exceeds its cluster chain"
-            );
-            let name = &entry[0x40..0x60];
-            let first_child = if directory == card.get_superblock_rootdir_cluster()? {
-                1
-            } else {
-                2
-            };
-            for index in first_child..count {
-                let offset = index * DIR_ENTRY_LENGTH;
-                if get_u16(&contents, offset)? & DIR_ENTRY_MODE_EXISTS != 0 {
-                    let existing = &contents[offset + 0x40..offset + 0x60];
-                    let end = existing
-                        .iter()
-                        .position(|b| *b == 0)
-                        .unwrap_or(existing.len());
-                    let new_end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
-                    anyhow::ensure!(
-                        !existing[..end].eq_ignore_ascii_case(&name[..new_end]),
-                        "entry already exists: {:?}",
-                        String::from_utf8_lossy(&name[..new_end])
-                    );
-                }
-            }
-            let slot = (first_child..contents.len() / DIR_ENTRY_LENGTH)
-                .find(|i| {
-                    get_u16(&contents, i * DIR_ENTRY_LENGTH)
-                        .is_ok_and(|m| m & DIR_ENTRY_MODE_EXISTS == 0)
-                })
-                .unwrap_or(count);
-            if slot >= contents.len() / DIR_ENTRY_LENGTH {
-                anyhow::bail!("directory is full");
-            }
-            contents[slot * DIR_ENTRY_LENGTH..(slot + 1) * DIR_ENTRY_LENGTH].copy_from_slice(entry);
-            let new_count = count.max(slot + 1);
-            contents[4..8].copy_from_slice(&u32::try_from(new_count)?.to_le_bytes());
-            write_chain_data(card, directory, &contents)
-        }
-
-        let src_name = src
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("source path must have a UTF-8 file name")?
-            .to_owned();
-        let node = read_node(src, src_name, 0)?;
-        let components: Vec<_> = dst
-            .components()
-            .filter_map(|component| match component {
-                Component::RootDir | Component::CurDir => None,
-                Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
-                _ => Some(String::new()),
-            })
-            .collect();
-        anyhow::ensure!(
-            !components.iter().any(String::is_empty),
-            "destination path must not contain parent or prefix components"
-        );
-        let mut directory = self.get_superblock_rootdir_cluster()?;
-        for component in components {
-            Self::validate_entry_name(&component)?;
-            let contents = self.read_cluster_chain(directory)?;
-            let count = usize::try_from(get_u32(&contents, 4)?)?;
-            let mut found = None;
-            let first_child = if directory == self.get_superblock_rootdir_cluster()? {
-                1
-            } else {
-                2
-            };
-            for index in first_child..count {
-                let offset = index * DIR_ENTRY_LENGTH;
-                if get_u16(&contents, offset)? & (DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY)
-                    == (DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY)
-                {
-                    let bytes = &contents[offset + 0x40..offset + 0x60];
-                    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-                    if bytes[..end].eq_ignore_ascii_case(component.as_bytes()) {
-                        found = Some(get_u32(&contents, offset + 0x10)?);
-                        break;
-                    }
-                }
-            }
-            directory =
-                found.with_context(|| format!("destination directory {component:?} not found"))?;
-        }
-        let entry = insert_child(self, node, directory, 0)?;
-        add_entry(self, directory, &entry)
     }
 
     pub fn remove_path(&mut self, path: &UnixPath) -> Result<()> {
@@ -819,12 +583,12 @@ impl MemoryCard {
                 "save folder {name:?} already exists on destination"
             );
         }
-        let free_slot = (1..dst_root.len() / DIR_ENTRY_LENGTH)
-            .find(|index| {
-                get_u16(&dst_root, index * DIR_ENTRY_LENGTH)
-                    .is_ok_and(|mode| mode & DIR_ENTRY_MODE_EXISTS == 0)
-            })
-            .context("destination root directory is full")?;
+        let existing_slot = (1..dst_root.len() / DIR_ENTRY_LENGTH).find(|index| {
+            get_u16(&dst_root, index * DIR_ENTRY_LENGTH)
+                .is_ok_and(|mode| mode & DIR_ENTRY_MODE_EXISTS == 0)
+        });
+        let free_slot = existing_slot.unwrap_or(dst_root.len() / DIR_ENTRY_LENGTH);
+        let grow_root = existing_slot.is_none();
 
         let mut dir_specs = Vec::new();
         let mut all_chains: Vec<Vec<u32>> = Vec::new();
@@ -869,7 +633,7 @@ impl MemoryCard {
         }
         let required: usize = all_chains.iter().map(Vec::len).sum();
         anyhow::ensure!(
-            allocated.len() >= required,
+            allocated.len() >= required + usize::from(grow_root),
             "destination memory card has insufficient free space"
         );
         let alloc_start = self.get_superblock_alloc_offset()?;
@@ -882,6 +646,22 @@ impl MemoryCard {
                     .or_insert_with(|| next.next().expect("capacity checked"));
             }
         }
+        let grown_root_cluster = if grow_root {
+            let cluster = next
+                .next()
+                .context("memory card has insufficient free space")?;
+            let last = *dst_root_chain
+                .last()
+                .context("destination root has an empty cluster chain")?;
+            self.set_fat_entry(last, 0x8000_0000 | cluster)?;
+            self.set_fat_entry(cluster, CLUSTER_LINK_END)?;
+            let cluster_len =
+                self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
+            self.write_cluster_bytes(alloc_start + cluster, 0, &vec![0; cluster_len])?;
+            Some(cluster)
+        } else {
+            None
+        };
         for chain in &all_chains {
             let mapped: Vec<_> = chain.iter().map(|c| mappings[c]).collect();
             for (i, &cluster) in mapped.iter().enumerate() {
@@ -942,8 +722,12 @@ impl MemoryCard {
         let cluster_len =
             self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
         let offset = free_slot * DIR_ENTRY_LENGTH;
-        let physical = alloc_start + dst_root_chain[offset / cluster_len];
-        self.write_cluster_bytes(physical, offset % cluster_len, &copied_entry)?;
+        if let Some(cluster) = grown_root_cluster {
+            self.write_cluster_bytes(alloc_start + cluster, 0, &copied_entry)?;
+        } else {
+            let physical = alloc_start + dst_root_chain[offset / cluster_len];
+            self.write_cluster_bytes(physical, offset % cluster_len, &copied_entry)?;
+        }
         if free_slot >= dst_count {
             let count_offset = 4;
             let count_physical = alloc_start + dst_root_chain[count_offset / cluster_len];
@@ -956,107 +740,9 @@ impl MemoryCard {
         Ok(())
     }
 
-    pub fn read(&self, path: &UnixPath) -> Result<Vec<u8>> {
-        if !path.is_absolute() {
-            return Err(anyhow!("path is not absolute"));
-        }
+    fn read_dir<P: AsRef<UnixPath>>(&self, path: P) -> Result<fs::ReadDir> {
+        let path = path.as_ref();
 
-        let components: Vec<String> = path
-            .components()
-            .filter_map(|component| match component {
-                UnixComponent::RootDir | UnixComponent::CurDir => None,
-                UnixComponent::Normal(name) => Some(String::from_utf8_lossy(name).into_owned()),
-                UnixComponent::ParentDir => Some(String::new()),
-            })
-            .collect();
-        anyhow::ensure!(!components.is_empty(), "cannot read a directory");
-        anyhow::ensure!(
-            !components.iter().any(String::is_empty),
-            "path must not contain parent or prefix components"
-        );
-
-        let root = self.get_superblock_rootdir_cluster()?;
-        let mut directory = root;
-        for component in &components[..components.len() - 1] {
-            let contents = self.read_cluster_chain(directory)?;
-            let count = usize::try_from(get_u32(&contents, 4)?)?;
-            anyhow::ensure!(
-                count <= contents.len() / DIR_ENTRY_LENGTH,
-                "directory entry count exceeds its cluster chain"
-            );
-            let first_child = if directory == root { 1 } else { 2 };
-            let mut found = None;
-            for index in first_child..count {
-                let offset = index * DIR_ENTRY_LENGTH;
-                let mode = get_u16(&contents, offset)?;
-                if mode & (DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY)
-                    != (DIR_ENTRY_MODE_EXISTS | DIR_ENTRY_MODE_DIRECTORY)
-                {
-                    continue;
-                }
-                let name = &contents[offset + 0x40..offset + 0x60];
-                let end = name
-                    .iter()
-                    .position(|byte| *byte == 0)
-                    .unwrap_or(name.len());
-                if name[..end].eq_ignore_ascii_case(component.as_bytes()) {
-                    anyhow::ensure!(found.is_none(), "multiple directories named {component:?}");
-                    found = Some(get_u32(&contents, offset + 0x10)?);
-                }
-            }
-            directory = found.with_context(|| format!("directory {component:?} not found"))?;
-        }
-
-        let name = components.last().expect("nonempty path");
-        let contents = self.read_cluster_chain(directory)?;
-        let count = usize::try_from(get_u32(&contents, 4)?)?;
-        anyhow::ensure!(
-            count <= contents.len() / DIR_ENTRY_LENGTH,
-            "directory entry count exceeds its cluster chain"
-        );
-        let first_child = if directory == root { 1 } else { 2 };
-        let mut found = None;
-        for index in first_child..count {
-            let offset = index * DIR_ENTRY_LENGTH;
-            let mode = get_u16(&contents, offset)?;
-            if mode & DIR_ENTRY_MODE_EXISTS == 0 {
-                continue;
-            }
-            let entry_name = &contents[offset + 0x40..offset + 0x60];
-            let end = entry_name
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(entry_name.len());
-            if entry_name[..end].eq_ignore_ascii_case(name.as_bytes()) {
-                anyhow::ensure!(found.is_none(), "multiple entries named {name:?}");
-                found = Some((
-                    mode,
-                    get_u32(&contents, offset + 4)?,
-                    get_u32(&contents, offset + 0x10)?,
-                ));
-            }
-        }
-        let (mode, size, first_cluster) = found.context("path not found")?;
-        anyhow::ensure!(
-            mode & (DIR_ENTRY_MODE_DIRECTORY | DIR_ENTRY_MODE_FILE) != 0,
-            "path is not a file or directory"
-        );
-        anyhow::ensure!(
-            mode & DIR_ENTRY_MODE_DIRECTORY == 0,
-            "cannot read a directory"
-        );
-
-        let size = usize::try_from(size)?;
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        let mut data = self.read_cluster_chain(first_cluster)?;
-        anyhow::ensure!(size <= data.len(), "file size exceeds its cluster chain");
-        data.truncate(size);
-        Ok(data)
-    }
-
-    pub fn read_dir(&self, path: &UnixPath) -> Result<ReadDir> {
         if !path.is_absolute() {
             return Err(anyhow!("path is not absolute"));
         }
@@ -1100,10 +786,11 @@ impl MemoryCard {
                     .position(|byte| *byte == 0)
                     .unwrap_or(bytes.len());
                 if bytes[..end].eq_ignore_ascii_case(component.as_bytes()) {
-                    found = Some((
-                        get_u32(&contents, offset + 0x10)?,
-                        usize::try_from(get_u32(&contents, offset + 4)?)?,
-                    ));
+                    let child = get_u32(&contents, offset + 0x10)?;
+                    // The entry's size field is not the live child count. The
+                    // directory cluster header is updated as entries are added.
+                    let child_contents = self.read_cluster_chain(child)?;
+                    found = Some((child, usize::try_from(get_u32(&child_contents, 4)?)?));
                     break;
                 }
             }
@@ -1146,10 +833,12 @@ impl MemoryCard {
             };
             entries.push(DirEntry::new(entry_path, file_type));
         }
-        Ok(ReadDir::new(entries))
+        Ok(fs::ReadDir::new(entries))
     }
 
-    pub fn create_dir(&mut self, path: &UnixPath) -> Result<()> {
+    fn create_dir<P: AsRef<UnixPath>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
+
         if !path.is_absolute() {
             return Err(anyhow!("path is not absolute"));
         }
@@ -1232,14 +921,7 @@ impl MemoryCard {
                 "entry already exists: {name:?}"
             );
         }
-        let capacity = contents.len() / DIR_ENTRY_LENGTH;
-        let slot = (first_child..capacity)
-            .find(|index| {
-                get_u16(&contents, index * DIR_ENTRY_LENGTH)
-                    .is_ok_and(|mode| mode & DIR_ENTRY_MODE_EXISTS == 0)
-            })
-            .unwrap_or(count);
-        anyhow::ensure!(slot < capacity, "directory is full");
+        let slot = self.find_or_grow_directory_slot(parent, &mut contents, first_child)?;
 
         let alloc_start = self.get_superblock_alloc_offset()?;
         let alloc_count = self
@@ -1294,7 +976,9 @@ impl MemoryCard {
         Ok(())
     }
 
-    pub fn write(&mut self, path: &UnixPath, contents: &[u8]) -> Result<()> {
+    fn write<P: AsRef<UnixPath>>(&mut self, path: P, contents: &[u8]) -> Result<()> {
+        let path = path.as_ref();
+
         if !path.is_absolute() {
             return Err(anyhow!("path is not absolute"));
         }
@@ -1379,14 +1063,7 @@ impl MemoryCard {
                 "entry already exists: {name:?}"
             );
         }
-        let capacity = directory.len() / DIR_ENTRY_LENGTH;
-        let slot = (first_child..capacity)
-            .find(|index| {
-                get_u16(&directory, index * DIR_ENTRY_LENGTH)
-                    .is_ok_and(|mode| mode & DIR_ENTRY_MODE_EXISTS == 0)
-            })
-            .unwrap_or(count);
-        anyhow::ensure!(slot < capacity, "directory is full");
+        let slot = self.find_or_grow_directory_slot(parent, &mut directory, first_child)?;
 
         let cluster_len =
             self.geometry()?.0 * usize::from(self.get_superblock_pages_per_cluster()?);
@@ -1786,24 +1463,6 @@ impl MemoryCard {
         Ok(saves)
     }
 
-    fn ensure_output_directory(path: &Path) -> Result<()> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => anyhow::ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "dump destination is not a regular directory: {}",
-                path.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(path)
-                    .with_context(|| format!("creating directory {}", path.display()))?;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("inspecting {}", path.display()));
-            }
-        }
-        Ok(())
-    }
-
     fn validate_entry_name(name: &str) -> Result<()> {
         anyhow::ensure!(
             !name.is_empty()
@@ -1897,5 +1556,87 @@ impl MemoryCard {
 
     pub fn get_superblock_card_flags(&self) -> Result<u8> {
         self.get_u8(0x151)
+    }
+}
+
+impl FileSystem<UnixPath> for MemoryCard {
+    type DirEntry = fs::DirEntry;
+    type ReadDir = fs::ReadDir;
+
+    fn create_dir<PathRef: AsRef<UnixPath>>(&mut self, path: PathRef) -> io::Result<()> {
+        self.create_dir(path).map_err(io::Error::other)
+    }
+
+    fn read<PathRef: AsRef<UnixPath>>(&self, path: PathRef) -> io::Result<Vec<u8>> {
+        todo!()
+    }
+
+    fn read_dir<PathRef: AsRef<UnixPath>>(&self, path: PathRef) -> io::Result<Self::ReadDir> {
+        self.read_dir(path).map_err(io::Error::other)
+    }
+
+    fn write<PathRef: AsRef<UnixPath>>(
+        &mut self,
+        path: PathRef,
+        contents: &[u8],
+    ) -> io::Result<()> {
+        self.write(path, contents).map_err(io::Error::other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ok() {
+        let mut memory_card = MemoryCard::new();
+
+        memory_card.create_dir("/foo").unwrap();
+        memory_card.create_dir("/bar").unwrap();
+        memory_card.create_dir("/baz").unwrap();
+
+        memory_card.create_dir("/foo/bar").unwrap();
+        memory_card.create_dir("/foo/bar/baz").unwrap();
+
+        let mut entries_root: Vec<_> = memory_card
+            .read_dir("/")
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+
+        entries_root.sort_by_key(|entry| entry.file_name());
+
+        assert_eq!(entries_root.len(), 3);
+        assert_eq!(entries_root[0].file_name(), "bar");
+        assert_eq!(entries_root[0].file_type(), fs::FileType::Directory);
+        assert_eq!(entries_root[1].file_name(), "baz");
+        assert_eq!(entries_root[1].file_type(), fs::FileType::Directory);
+        assert_eq!(entries_root[2].file_name(), "foo");
+        assert_eq!(entries_root[2].file_type(), fs::FileType::Directory);
+
+        let mut entries_foo: Vec<_> = memory_card
+            .read_dir("/foo")
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+
+        entries_foo.sort_by_key(|entry| entry.file_name());
+
+        assert_eq!(entries_foo.len(), 1);
+        assert_eq!(entries_foo[0].file_name(), "bar");
+        assert_eq!(entries_foo[0].file_type(), fs::FileType::Directory);
+
+        let mut entries_foo_bar: Vec<_> = memory_card
+            .read_dir("/foo/bar")
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect();
+
+        entries_foo_bar.sort_by_key(|entry| entry.file_name());
+
+        assert_eq!(entries_foo_bar.len(), 1);
+        assert_eq!(entries_foo_bar[0].file_name(), "baz");
+        assert_eq!(entries_foo_bar[0].file_type(), fs::FileType::Directory);
     }
 }
