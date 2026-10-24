@@ -6,6 +6,7 @@ use crate::cli::Cli;
 
 mod assets;
 mod cli;
+mod fs;
 mod ps2;
 
 fn main() -> ExitCode {
